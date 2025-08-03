@@ -1,30 +1,29 @@
-
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, Request, HTTPException, Header, UploadFile, File
 from pydantic import BaseModel
-import os, requests, fitz, tempfile, asyncio
+import os, requests, fitz, tempfile
 from dotenv import load_dotenv
-from typing import List, Optional, Union
+from typing import List, Optional
 from email import policy
 from email.parser import BytesParser
 import docx
+from typing import List, Optional, Union
+from pydantic import BaseModel
 import urllib.parse
-import openai
-import re
 
 load_dotenv()
 
 app = FastAPI()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+MISTRAL_API_KEY = os.getenv("OPENAI_API_KEY")
 API_TOKEN = os.getenv("API_TOKEN")
 
-openai.api_key = OPENAI_API_KEY
-
+# Request schema
 class RunRequest(BaseModel):
-    documents: Optional[Union[str, List[str]]] = None
+    documents: Optional[Union[str, List[str]]] = None  # URLs for docs
     questions: List[str]
-    email_file: Optional[str] = None
+    email_file: Optional[str] = None       # Optional email file URL
 
+# Prompt Template
 PROMPT_TEMPLATE = """
 You are an insurance policy expert. Use ONLY the information provided in the context to answer the question.
 
@@ -46,12 +45,47 @@ Instructions:
 Answer:
 """
 
+# ---------------- Mistral API ----------------
+# def call_mistral(prompt: str) -> str:
+#     url = "https://api.mistral.ai/v1/chat/completions"
+#     headers = {
+#         "Authorization": f"Bearer {MISTRAL_API_KEY}",
+#         "Content-Type": "application/json"
+#     }
+#     payload = {
+#         "model": "mistral-small-latest",
+#         "temperature": 0.3,
+#         "top_p": 1,
+#         "max_tokens": 500,
+#         "messages": [{"role": "user", "content": prompt}]
+#     }
+#     res = requests.post(url, headers=headers, json=payload)
+#     res.raise_for_status()
+#     return res.json()["choices"][0]["message"]["content"]
+
+import openai
+
+def call_openai_gpt4o(prompt: str) -> str:
+    response = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.3,
+        max_tokens=500,
+        top_p=1,
+    )
+    return response.choices[0].message.content.strip()
+
+
+# ---------------- Document Extractors ----------------
 def extract_text_from_pdf(pdf_url: str) -> str:
     response = requests.get(pdf_url)
     response.raise_for_status()
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(response.content)
         tmp_path = tmp.name
+
     text = ""
     doc = fitz.open(tmp_path)
     for page in doc:
@@ -66,6 +100,7 @@ def extract_text_from_docx(docx_url: str) -> str:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
         tmp.write(response.content)
         tmp_path = tmp.name
+
     doc = docx.Document(tmp_path)
     text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
     os.remove(tmp_path)
@@ -77,9 +112,12 @@ def extract_text_from_email(email_url: str) -> str:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".eml") as tmp:
         tmp.write(response.content)
         tmp_path = tmp.name
+
     with open(tmp_path, 'rb') as f:
         msg = BytesParser(policy=policy.default).parse(f)
     os.remove(tmp_path)
+
+    # Extract email text
     email_text = f"Subject: {msg['subject']}\n\n"
     if msg.is_multipart():
         for part in msg.walk():
@@ -89,48 +127,27 @@ def extract_text_from_email(email_url: str) -> str:
         email_text += msg.get_content()
     return email_text.strip()
 
-def get_relevant_context(document_text: str, question: str, max_sents: int = 5) -> str:
-    # Split document into sentences (basic splitting)
-    sents = re.split(r'(?<=[.!?])\s+', document_text)
-    question_keywords = [w for w in re.findall(r'\w+', question.lower()) if len(w) > 2]
-    sent_scores = []
-    for sent in sents:
-        score = sum(1 for w in question_keywords if w in sent.lower())
-        sent_scores.append((score, sent))
-    sent_scores.sort(reverse=True)  # More relevant first
-    top = [s for (score, s) in sent_scores if score > 0][:max_sents]
-    if not top:
-        top = sents[:max_sents]  # Fallback: first 5 sentences
-    return " ".join(top)
-
-async def ask_gpt4o(context, question):
-    prompt = PROMPT_TEMPLATE.format(context=context, query=question)
-    response = await asyncio.to_thread(
-        openai.chat.completions.create,
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-        max_tokens=300,
-        top_p=1,
-    )
-    return response.choices[0].message.content.strip()
-
 @app.get("/")
 def read_root():
     return {"message": "FastAPI is running"}
 
+# ---------------- API Endpoint ----------------
 @app.post("/api/v1/hackrx/run")
-async def run_analysis(request: RunRequest, authorization: str = Header(...)):
+def run_analysis(request: RunRequest, authorization: str = Header(...)):
     if authorization != f"Bearer {API_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
+
     try:
         combined_text = ""
+
+        # Extract from documents
         doc_urls = []
         if request.documents:
             if isinstance(request.documents, str):
                 doc_urls = [request.documents]
             elif isinstance(request.documents, list):
                 doc_urls = request.documents
+
         for doc_url in doc_urls:
             parsed_url = urllib.parse.urlparse(doc_url)
             file_name = os.path.basename(parsed_url.path).lower()
@@ -142,20 +159,38 @@ async def run_analysis(request: RunRequest, authorization: str = Header(...)):
                 combined_text += "\n" + requests.get(doc_url).text
             else:
                 raise HTTPException(status_code=400, detail=f"Unsupported document format: {doc_url}")
+
+        # Extract from email if provided
         if request.email_file:
             combined_text += "\n" + extract_text_from_email(request.email_file)
+
         if not combined_text.strip():
             raise HTTPException(status_code=400, detail="No valid content extracted from provided sources.")
 
-        # Extract relevant context per question
-        tasks = []
-        for q in request.questions:
-            context_for_q = get_relevant_context(combined_text, q)
-            tasks.append(ask_gpt4o(context_for_q, q))
-        answers = await asyncio.gather(*tasks)
+        context = combined_text.strip()
 
-        # Join answers as a single string with newlines
-        result_string = "\n".join(answers)
-        return {"answers": result_string}
+        # Format multiple questions as a single multi-question prompt
+        numbered_questions = "\n".join([f"{i+1}. {q}" for i, q in enumerate(request.questions)])
+        multi_question_prompt = PROMPT_TEMPLATE.format(context=context, query=numbered_questions)
+        multi_answer_response = call_openai_gpt4o(multi_question_prompt)
+
+        # Try splitting response by question number
+        split_answers = []
+        for i in range(len(request.questions)):
+            prefix = f"{i+1}."
+            next_prefix = f"{i+2}."
+            start = multi_answer_response.find(prefix)
+            end = multi_answer_response.find(next_prefix)
+            if start != -1:
+                answer = multi_answer_response[start:end].strip()
+                answer = answer.lstrip(f"{prefix}").strip()
+                split_answers.append(answer)
+        
+        # Fallback if not split properly
+        if not split_answers:
+            split_answers = [multi_answer_response.strip()]
+
+        return {"answers": split_answers}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
