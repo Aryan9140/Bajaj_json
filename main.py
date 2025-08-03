@@ -11,6 +11,8 @@ import asyncio
 load_dotenv()
 app = FastAPI()
 
+
+
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 API_TOKEN = os.getenv("API_TOKEN")
 
