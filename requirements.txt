@@ -9,3 +9,4 @@ langchain
 langchain-community
 faiss-cpu
 email-validator
+openai
