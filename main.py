@@ -15,7 +15,7 @@ load_dotenv()
 
 app = FastAPI()
 
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY1")
 API_TOKEN = os.getenv("API_TOKEN")
 
 # Request schema
