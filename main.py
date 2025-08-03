@@ -6,6 +6,7 @@ from typing import List, Optional
 from email import policy
 from email.parser import BytesParser
 import docx
+# from langchain_community.vectorstores import FAISS
 from typing import List, Optional, Union
 from pydantic import BaseModel
 import urllib.parse
@@ -14,7 +15,7 @@ load_dotenv()
 
 app = FastAPI()
 
-MISTRAL_API_KEY = os.getenv("OPENAI_API_KEY")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 API_TOKEN = os.getenv("API_TOKEN")
 
 # Request schema
@@ -46,37 +47,22 @@ Answer:
 """
 
 # ---------------- Mistral API ----------------
-# def call_mistral(prompt: str) -> str:
-#     url = "https://api.mistral.ai/v1/chat/completions"
-#     headers = {
-#         "Authorization": f"Bearer {MISTRAL_API_KEY}",
-#         "Content-Type": "application/json"
-#     }
-#     payload = {
-#         "model": "mistral-small-latest",
-#         "temperature": 0.3,
-#         "top_p": 1,
-#         "max_tokens": 500,
-#         "messages": [{"role": "user", "content": prompt}]
-#     }
-#     res = requests.post(url, headers=headers, json=payload)
-#     res.raise_for_status()
-#     return res.json()["choices"][0]["message"]["content"]
-
-import openai
-
-def call_openai_gpt4o(prompt: str) -> str:
-    response = openai.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.3,
-        max_tokens=500,
-        top_p=1,
-    )
-    return response.choices[0].message.content.strip()
-
+def call_mistral(prompt: str) -> str:
+    url = "https://api.mistral.ai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {MISTRAL_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "mistral-small-latest",
+        "temperature": 0.3,
+        "top_p": 1,
+        "max_tokens": 500,
+        "messages": [{"role": "user", "content": prompt}]
+    }
+    res = requests.post(url, headers=headers, json=payload)
+    res.raise_for_status()
+    return res.json()["choices"][0]["message"]["content"]
 
 # ---------------- Document Extractors ----------------
 def extract_text_from_pdf(pdf_url: str) -> str:
@@ -172,7 +158,7 @@ def run_analysis(request: RunRequest, authorization: str = Header(...)):
         # Format multiple questions as a single multi-question prompt
         numbered_questions = "\n".join([f"{i+1}. {q}" for i, q in enumerate(request.questions)])
         multi_question_prompt = PROMPT_TEMPLATE.format(context=context, query=numbered_questions)
-        multi_answer_response = call_openai_gpt4o(multi_question_prompt)
+        multi_answer_response = call_mistral(multi_question_prompt)
 
         # Try splitting response by question number
         split_answers = []

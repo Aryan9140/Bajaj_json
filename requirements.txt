@@ -10,3 +10,6 @@ langchain-community
 faiss-cpu
 email-validator
 openai
+
+
+scikit-learn
