@@ -52,7 +52,7 @@ async def call_mistral_async(prompt: str) -> str:
         "model": "mistral-small-latest",
         "temperature": 0,
         "top_p": 1,
-        "max_tokens": 512,
+        "max_tokens": 150,
         "messages": [{"role": "user", "content": prompt}]
     }
     async with httpx.AsyncClient(timeout=60) as client:
