@@ -14,7 +14,9 @@
 
 # scikit-learn
 
-
+rapidfuzz
+sentence_transformers
+torch --extra-index-url https://download.pytorch.org/whl/cpu
 fastapi
 uvicorn
 pydantic
