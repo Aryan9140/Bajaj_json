@@ -70,8 +70,10 @@ async def call_groq_async(prompt: str) -> str:
         res = await client.post(url, headers=headers, json=payload)
         res.raise_for_status()
         return res.json()["choices"][0]["message"]["content"]
+    
 
 # --- Mistral primary with fallback to Groq (updated) ---
+
 async def call_mistral_async(prompt: str) -> str:
     url = "https://api.mistral.ai/v1/chat/completions"
     headers = {
@@ -88,6 +90,7 @@ async def call_mistral_async(prompt: str) -> str:
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             res = await client.post(url, headers=headers, json=payload)
+
             # Fallback triggers: Too Many Requests / Payload Too Large / Server errors
             if res.status_code in (429, 413, 500, 502, 503):
                 if GROQ_API_KEY:
