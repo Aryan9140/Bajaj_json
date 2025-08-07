@@ -39,6 +39,7 @@ pinecone-client
 pinecone-text
 langchain-community
 langchain-huggingface
+openai
 
 
 # pip uninstall pinecone-client -y
