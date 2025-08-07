@@ -1,49 +1,9 @@
-# fastapi
-# uvicorn
-# pydantic
-# python-dotenv
-# requests
-# pymupdf
-# python-docx
-# langchain
-# langchain-community
-# faiss-cpu
-# email-validator
-# openai
-
-
-# scikit-learn
-pillow
-pytesseract
-rapidfuzz
-# sentence_transformers
-# torch --extra-index-url https://download.pytorch.org/whl/cpu
 fastapi
 uvicorn
 pydantic
-python-dotenv
-numpy
-
-
-
 requests
 httpx
+python-dotenv
+pillow
 PyMuPDF
-python-docx
-pymupdf
-email-validator
-
-
-
-pinecone-client
-pinecone-text
-langchain-community
-langchain-huggingface
-openai
-
-
-# pip uninstall pinecone-client -y
-# pip uninstall pinecone -y
-# pine code work after i install this in terminal ---------
-# pip install 'pinecone>=3.0.0'
-
+pytesseract
