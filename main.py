@@ -1,48 +1,80 @@
-# api.py — FastAPI with strict per-question Mistral→Groq fallback + robust PDF chunking + selective OCR + safe OCR fallback
-# pip install fastapi uvicorn python-dotenv httpx pymupdf pillow pytesseract python-docx rapidfuzz
-# (Windows: install Tesseract OCR: https://github.com/tesseract-ocr/tesseract)
-# export API_TOKEN=… MISTRAL_API_KEY=… GROQ_API_KEY=…
-# uvicorn api:app --host 0.0.0.0 --port 8000 --reload
-
+import os, requests, fitz, tempfile, docx, urllib.parse, io, re, asyncio, httpx
+from PIL import Image
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
-import os, requests, fitz, tempfile, docx, urllib.parse, io
-from dotenv import load_dotenv
 from typing import List, Optional, Union
 from email import policy
 from email.parser import BytesParser
-import httpx, asyncio
-
-from PIL import Image
-import pytesseract
 from rapidfuzz import fuzz
+import pytesseract
+import random
+
+# For OpenRouter
+from openai import OpenAI
 
 load_dotenv()
 app = FastAPI()
 
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
-API_TOKEN       = os.getenv("API_TOKEN")
-GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
+MISTRAL_API_KEY  = os.getenv("MISTRAL_API_KEY")
+GROQ_API_KEY     = os.getenv("GROQ_API_KEY")
+OPENROUTER_KEY   = os.getenv("OPENROUTER_API_KEY")
+API_TOKEN        = os.getenv("API_TOKEN")
 
-PROMPT_TEMPLATE = """
-You are an expert insurance policy analyst. Your job is to answer ONE question at a time, ONLY using the text from the context below. 
+# Set Tesseract PATH for Windows backup
+os.environ["PATH"] += os.pathsep + r"C:\Program Files\Tesseract-OCR"
 
-Instructions:
-- For the question below, return the answer **EXACTLY as stated in the context**, quoting all relevant numbers, time periods, percentages, benefit limits, eligibility criteria, exclusions, waiting periods, sub-limits, and conditions word‐for‐word.
-- Do not skip or summarize any information. **Include every detail and clause found in the context** that answers the question.
-- If additional explanation is present in nearby sentences or sections, include those as well to make the answer more complete.
-- If the answer is “Yes” or “No,” always give the full policy conditions, criteria, exclusions, or requirements following your answer.
-- If the answer refers to a definition (like ‘Hospital’ or ‘AYUSH’), copy the full formal definition as given in the context.
-- If information is not found in the policy, reply exactly: "Not mentioned in the policy."
-- **Do not invent or infer anything not directly found in the context.**
-- Begin your answer with: “{question_number}. ” (example: “3. Yes, the policy covers ...”)
-- Write your answer as a single, complete, formal sentence (or sentences), matching the tone of the policy.
+# --- PROMPTING ---
+QA_PROMPT = """
+You are an expert insurance policy analyst. ONLY answer from the context. Quote all numbers, limits, years, eligibility, conditions, and requirements word-for-word.
+If the answer is "Yes" or "No", briefly explain why. If not found, say "Not mentioned in the policy."
+Write a detailed but concise paragraph, including all points relevant to the question.
 
 Context:
 {context}
 
 Question:
 {question}
+
+Answer:
+"""
+
+GROQ_RECHECK_PROMPT = """
+You are a strict insurance policy answer reviewer. Carefully check the following answer for the user's question, based only on the policy context.
+If the answer is not fully correct, not complete, or "Not mentioned in the policy", use ONLY the context below to generate a more complete answer. 
+DO NOT invent, add, or summarize anything not in the context.
+
+Context:
+{context}
+
+Question:
+{question}
+
+Draft Answer:
+{draft}
+
+Improved/Corrected Answer:
+"""
+
+OPENROUTER_FINAL_PROMPT = """
+You are an expert insurance policy chatbot. Given the policy context, the user question, and two draft answers below,
+choose or improve the most complete, policy-accurate answer using only the policy context. If "Not mentioned in the policy", recheck with the context.
+If both are incomplete, you may rewrite using details ONLY from context.
+If no answer can be given, respond with: Not mentioned in the policy.
+
+Policy Context:
+{context}
+
+Question:
+{question}
+
+Draft Answer 1 (from Mistral or Groq):
+{ans1}
+
+Draft Answer 2 (from Groq or Mistral):
+{ans2}
+
+Final Best Answer:
 """
 
 class RunRequest(BaseModel):
@@ -50,100 +82,93 @@ class RunRequest(BaseModel):
     questions: List[str]
     email_file: Optional[str] = None
 
-# --- Groq fallback ---
-async def call_groq_async(prompt: str) -> str:
-    if not GROQ_API_KEY:
-        raise HTTPException(status_code=502, detail="Groq fallback unavailable (GROQ_API_KEY not set)")
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type":  "application/json"
-    }
-    payload = {
-        "model":       "llama3-70b-8192",
-        "temperature": 0,
-        "top_p":       1,
-        "max_tokens":  850,
-        "messages":    [{"role": "user", "content": prompt}]
-    }
-    async with httpx.AsyncClient(timeout=60) as client:
-        res = await client.post(url, headers=headers, json=payload)
-        res.raise_for_status()
-        return res.json()["choices"][0]["message"]["content"]
-
-# --- Mistral primary + fallback ---
-async def call_mistral_async(prompt: str) -> str:
+# ------------- LLM FUNCTIONS ---------------
+async def call_mistral(prompt: str) -> str:
     url = "https://api.mistral.ai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {MISTRAL_API_KEY}",
-        "Content-Type":  "application/json"
-    }
+    headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
     payload = {
-        "model":       "mistral-small-latest",
-        "temperature": 0,
-        "top_p":       1,
-        "max_tokens":  850,
-        "messages":    [{"role": "user", "content": prompt}]
+        "model": "mistral-small-latest",
+        "temperature": 0.13, "top_p": 1, "max_tokens": 950,
+        "messages": [{"role": "user", "content": prompt}]
     }
     async with httpx.AsyncClient(timeout=60) as client:
         res = await client.post(url, headers=headers, json=payload)
-        if res.status_code in (429, 413, 500, 502, 503) and GROQ_API_KEY:
-            return await call_groq_async(prompt)
         res.raise_for_status()
-        return res.json()["choices"][0]["message"]["content"]
+        return res.json()["choices"][0]["message"]["content"].strip()
 
-# --- PDF extraction w/ per-page text/OCR (handles 400+ pages, chunking for LLM context size) ---
-MIN_TEXT_LEN = 50  # pages shorter than this run through OCR
+async def call_groq(prompt: str, max_retries=3) -> str:
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "temperature": 0.13, "top_p": 1, "max_tokens": 950,
+        "messages": [{"role": "user", "content": prompt}]
+    }
+    last_error = None
+    for attempt in range(max_retries):
+        async with httpx.AsyncClient(timeout=60) as client:
+            res = await client.post(url, headers=headers, json=payload)
+            if res.status_code == 429:
+                wait = 2 ** attempt + random.uniform(0, 1)
+                print(f"Groq 429 received, retrying in {wait:.1f}s...")
+                await asyncio.sleep(wait)
+                last_error = res
+                continue
+            try:
+                res.raise_for_status()
+                return res.json()["choices"][0]["message"]["content"].strip()
+            except Exception as e:
+                last_error = e
+                break
+    print("Groq LLM failed after retries:", last_error)
+    return "Not mentioned in the policy."
 
-def extract_text_pages_from_pdf(pdf_url: str) -> list:
-    r = requests.get(pdf_url)
+async def call_openrouter_gpt4o(prompt: str) -> str:
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=OPENROUTER_KEY,
+    )
+    completion = await asyncio.to_thread(
+        lambda: client.chat.completions.create(
+            extra_headers={},
+            model="openai/gpt-4o",
+            messages=[{"role": "user", "content": prompt}]
+        )
+    )
+    return completion.choices[0].message.content.strip()
+
+# ------------ FILE EXTRACTORS (async for OCR) ----------
+async def ocr_page_async(page, dpi=200):
+    try:
+        pix = page.get_pixmap(dpi=dpi)
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        return pytesseract.image_to_string(img, config="--psm 6")
+    except Exception as e:
+        print(f"OCR error: {e}")
+        return ""
+
+async def extract_text_pages_from_pdf(pdf_url: str, ocr_min_len=40, ocr_max_pages=20, dpi=200):
+    r = requests.get(pdf_url, timeout=20)
     r.raise_for_status()
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(r.content)
         path = tmp.name
-
-    page_texts = []
     doc = fitz.open(path)
+    page_texts, ocr_tasks, ocr_indices = [], [], []
     for i, page in enumerate(doc):
         txt = page.get_text("text") or ""
-        if len(txt.strip()) < MIN_TEXT_LEN:
-            # Try OCR, handle all exceptions gracefully
-            try:
-                pix = page.get_pixmap(dpi=200)
-                img = Image.open(io.BytesIO(pix.tobytes("png")))
-                try:
-                    ocr_txt = pytesseract.image_to_string(img)
-                    if len(ocr_txt.strip()) > len(txt.strip()):
-                        print(f"[OCR] Page {i+1}: OCR used.")
-                        txt = ocr_txt
-                    else:
-                        print(f"[OCR] Page {i+1}: OCR produced less text, using original.")
-                except pytesseract.TesseractNotFoundError as e:
-                    print(f"[OCR ERROR] Tesseract not found: {e}. Skipping OCR for page {i+1}.")
-                except Exception as e:
-                    print(f"[OCR ERROR] Other OCR error on page {i+1}: {e}")
-            except Exception as e:
-                print(f"[PDF→Image ERROR] Could not render page {i+1} to image: {e}")
-        page_texts.append(txt)
+        if len(txt.strip()) < ocr_min_len and len(ocr_tasks) < ocr_max_pages:
+            ocr_tasks.append(ocr_page_async(page, dpi))
+            ocr_indices.append(i)
+            page_texts.append(None)
+        else:
+            page_texts.append(txt)
+    ocr_results = await asyncio.gather(*ocr_tasks) if ocr_tasks else []
+    for idx, text in zip(ocr_indices, ocr_results):
+        page_texts[idx] = text
     doc.close()
     os.remove(path)
-    return page_texts  # returns list of page_texts
-
-def find_relevant_chunk(pages, question, window=2):
-    # Find best match page and expand to window pages before/after
-    best_score = -1
-    best_idx = 0
-    for i, txt in enumerate(pages):
-        score = fuzz.token_set_ratio(question, txt)
-        if score > best_score:
-            best_score = score
-            best_idx = i
-    # Expand window for more context, but stay in bounds
-    start = max(0, best_idx - window)
-    end   = min(len(pages), best_idx + window + 1)
-    chunk = "\n".join(pages[start:end])
-    # Limit to 8500 chars (about 3400 tokens)
-    return chunk[:8500]
+    return [t or "" for t in page_texts]
 
 def extract_text_from_docx(docx_url: str) -> str:
     r = requests.get(docx_url)
@@ -155,6 +180,9 @@ def extract_text_from_docx(docx_url: str) -> str:
     text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
     os.remove(path)
     return text
+
+def extract_text_from_txt(txt_url: str) -> str:
+    return requests.get(txt_url).text
 
 def extract_text_from_email(email_url: str) -> str:
     r = requests.get(email_url)
@@ -174,62 +202,80 @@ def extract_text_from_email(email_url: str) -> str:
         body += msg.get_content()
     return body.strip()
 
+def get_relevant_context(pages, question, window=3, maxlen=9000):
+    best_score, best_idx = -1, 0
+    for i, txt in enumerate(pages):
+        score = fuzz.token_set_ratio(question, txt)
+        if score > best_score:
+            best_score = score
+            best_idx = i
+    start = max(0, best_idx - window)
+    end   = min(len(pages), best_idx + window + 1)
+    chunk = "\n".join(pages[start:end])
+    # Add all lines with numbers, limits, % etc.
+    all_lines = [line.strip() for p in pages for line in p.split('\n') if len(line.strip()) > 10]
+    pattern = re.compile(r'\d+\s*(day|month|year|%)|sum insured|premium|grace|waiting|limit|sub-limit|renewal|NCD|check[-\s]?up|capped|maximum|minimum|deductible|coverage|room rent|ICU|AYUSH|organ donor|claim|settle|required|document', re.I)
+    extra_context = "\n".join(list(dict.fromkeys([line for line in all_lines if pattern.search(line)])))
+    return (chunk + "\n" + extra_context)[:maxlen]
+
 @app.get("/")
 def health():
     return {"message": "OK"}
 
 @app.post("/api/v1/hackrx/run")
 async def run_analysis(request: RunRequest, authorization: str = Header(...)):
-    print("Received request:", request)
     if authorization != f"Bearer {API_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
-
-    docs = []
-    if request.documents:
-        docs = [request.documents] if isinstance(request.documents, str) else request.documents
-    if not docs or not request.questions:
-        raise HTTPException(status_code=400, detail="Provide both 'documents' and 'questions'.")
-
-    all_doc_chunks = []
-    all_doc_types  = []
-    for url in docs:
-        path = urllib.parse.urlparse(url).path.lower()
+    doc_urls = [request.documents] if isinstance(request.documents, str) else request.documents
+    all_pages, pdf_extract_tasks = [], []
+    for doc_url in doc_urls:
+        path = urllib.parse.urlparse(doc_url).path.lower()
         if path.endswith(".pdf"):
-            all_doc_chunks.append(extract_text_pages_from_pdf(url))  # List of pages
-            all_doc_types.append("pdf")
+            pdf_extract_tasks.append(extract_text_pages_from_pdf(doc_url))
         elif path.endswith(".docx"):
-            all_doc_chunks.append([extract_text_from_docx(url)])
-            all_doc_types.append("docx")
+            all_pages += [extract_text_from_docx(doc_url)]
         elif path.endswith(".txt"):
-            all_doc_chunks.append([requests.get(url).text])
-            all_doc_types.append("txt")
+            all_pages += [extract_text_from_txt(doc_url)]
+        elif path.endswith(".eml"):
+            all_pages += [extract_text_from_email(doc_url)]
         else:
-            raise HTTPException(400, detail=f"Unsupported format: {url}")
+            raise HTTPException(400, detail=f"Unsupported format: {doc_url}")
+    if pdf_extract_tasks:
+        pdf_results = await asyncio.gather(*pdf_extract_tasks)
+        for res in pdf_results:
+            all_pages += res
+    if not all_pages:
+        raise HTTPException(status_code=400, detail="No valid content extracted.")
 
-    if not all_doc_chunks:
-        raise HTTPException(400, detail="No content extracted.")
-
-    async def get_answer(i: int, q: str) -> str:
-        # Use chunked context for each question
-        if len(all_doc_chunks) == 1 and all_doc_types[0] == "pdf":
-            pages = all_doc_chunks[0]
-            relevant_context = find_relevant_chunk(pages, q, window=2)  # get 2 pages before/after
-        else:
-            # For docx/txt/other, just use all text (truncate for LLM input)
-            relevant_context = "\n".join(c for doc in all_doc_chunks for c in doc)
-            relevant_context = relevant_context[:8500]
-        prompt = PROMPT_TEMPLATE.format(
-            context=relevant_context,
-            question=q,
-            question_number=i+1
+    # -------- Dual LLM, then recheck with OpenRouter GPT-4o --------
+    async def get_best_llm_answer(q):
+        context = get_relevant_context(all_pages, q, window=3, maxlen=9000)
+        mistral_task = asyncio.create_task(call_mistral(QA_PROMPT.format(context=context, question=q)))
+        groq_task    = asyncio.create_task(call_groq(QA_PROMPT.format(context=context, question=q)))
+        mistral_answer, groq_answer = await asyncio.gather(mistral_task, groq_task)
+        # If both say "not mentioned", increase window and retry once
+        if ("not mentioned" in mistral_answer.lower() and "not mentioned" in groq_answer.lower()):
+            context = get_relevant_context(all_pages, q, window=6, maxlen=15000)
+            mistral_answer = await call_mistral(QA_PROMPT.format(context=context, question=q))
+            groq_answer    = await call_groq(QA_PROMPT.format(context=context, question=q))
+        # Let OpenRouter GPT-4o act as final judge/enhancer
+        openrouter_prompt = OPENROUTER_FINAL_PROMPT.format(
+            context=context, question=q, ans1=mistral_answer, ans2=groq_answer
         )
-        resp = await call_mistral_async(prompt)
-        ans  = resp.strip()
-        prefix = f"{i+1}."
-        if ans.startswith(prefix):
-            ans = ans[len(prefix):].strip()
-        return ans
+        try:
+            final_answer = await call_openrouter_gpt4o(openrouter_prompt)
+        except Exception as e:
+            print("OpenRouter LLM failed:", e)
+            # fallback: prefer most detailed non-"not mentioned" answer
+            if (mistral_answer and "not mentioned" not in mistral_answer.lower()):
+                final_answer = mistral_answer
+            elif (groq_answer and "not mentioned" not in groq_answer.lower()):
+                final_answer = groq_answer
+            else:
+                final_answer = "Not mentioned in the policy."
+        if not final_answer or len(final_answer) < 10:
+            final_answer = mistral_answer or groq_answer or "Not mentioned in the policy."
+        return final_answer.strip()
 
-    tasks   = [get_answer(i, q) for i, q in enumerate(request.questions)]
-    answers = await asyncio.gather(*tasks)
+    answers = await asyncio.gather(*[get_best_llm_answer(q) for q in request.questions])
     return {"answers": answers}
