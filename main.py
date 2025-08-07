@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+
 #pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
@@ -16,6 +18,8 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 API_TOKEN = os.getenv("API_TOKEN")
 
 app = FastAPI()
+
+
 
 class RunRequest(BaseModel):
     documents: str
@@ -124,7 +128,9 @@ def split_text(text: str, chunk_size=1500, overlap=200) -> List[str]:
         start += chunk_size - overlap
     return chunks[:10]
 
-# Mistral LLM
+
+# Mistral LLM to respond to questions
+
 def call_mistral(prompt: str) -> str:
     url = "https://api.mistral.ai/v1/chat/completions"
     headers = {
@@ -193,6 +199,8 @@ async def run_analysis(request: RunRequest, authorization: str = Header(...)):
         question_block = "\n".join([f"{i+1}. {q}" for i, q in enumerate(request.questions)])
 
         # Case 1: Full PDF (<= 100 pages)
+
+
         if page_count <= 100:
             try:
                 prompt = FULL_PROMPT_TEMPLATE.format(context=full_text, query=question_block)
@@ -203,6 +211,7 @@ async def run_analysis(request: RunRequest, authorization: str = Header(...)):
                 raise HTTPException(status_code=500, detail="Mistral failed on full content.")
 
         # Case 2: Chunked PDF (<= 200 pages)
+
         elif page_count <= 200:
             try:
                 answers = call_mistral_on_chunks(chunks, request.questions)
@@ -215,6 +224,7 @@ async def run_analysis(request: RunRequest, authorization: str = Header(...)):
                     raise HTTPException(status_code=500, detail="All LLMs failed for chunks.")
 
         # Case 3: Large (> 200 pages) → Use title and public info
+        
         else:
             try:
                 prompt = WEB_PROMPT_TEMPLATE.format(title=title, query=question_block)
