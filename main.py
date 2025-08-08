@@ -121,7 +121,7 @@ def extract_text_from_pdf_url(pdf_url: str) -> tuple[str, int, str]:
     os.remove(tmp_path)
     return (full_text.strip() if page_count <= 200 else "", page_count, title or "Untitled Document")
 
-def split_text(text: str, chunk_size=1500, overlap=200) -> List[str]:
+def split_text(text: str, chunk_size=1300, overlap=200) -> List[str]:
     chunks, start = [], 0
     while start < len(text):
         chunks.append(text[start:start + chunk_size])
@@ -224,7 +224,7 @@ async def run_analysis(request: RunRequest, authorization: str = Header(...)):
                     raise HTTPException(status_code=500, detail="All LLMs failed for chunks.")
 
         # Case 3: Large (> 200 pages) → Use title and public info
-        
+
         else:
             try:
                 prompt = WEB_PROMPT_TEMPLATE.format(title=title, query=question_block)
