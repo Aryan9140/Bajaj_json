@@ -6,6 +6,7 @@ import fitz
 from PIL import Image
 import pytesseract
 import requests, httpx
+import asyncio
 from dotenv import load_dotenv
 
 # ---------------- App & Clients ----------------
