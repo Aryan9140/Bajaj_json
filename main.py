@@ -117,11 +117,11 @@ def approx_tokens_from_text(s: str) -> int:
 def choose_mistral_params(page_count: int, context_text: str | None):
     ctx_tok = approx_tokens_from_text(context_text or "")
     if page_count <= 100:
-        max_tokens, temperature, timeout = 1100, 0.3, 15
+        max_tokens, temperature, timeout = 1100, 0.22, 15
     elif page_count <= 200:
-        max_tokens, temperature, timeout = 900, 0.3, 15
+        max_tokens, temperature, timeout = 1400, 0.22, 15
     else:
-        max_tokens, temperature, timeout = 800, 0.25, 12
+        max_tokens, temperature, timeout = 800, 0.18, 12
     total_budget = 3500
     budget_left = max(600, total_budget - ctx_tok)
     return {"max_tokens": min(max_tokens, budget_left), "temperature": temperature, "timeout": timeout}
@@ -129,11 +129,11 @@ def choose_mistral_params(page_count: int, context_text: str | None):
 def choose_groq_params(page_count: int, context_text: str | None):
     ctx_tok = approx_tokens_from_text(context_text or "")
     if page_count <= 100:
-        max_tokens, temperature, timeout = 1600, 0.2, 30
+        max_tokens, temperature, timeout = 1300, 0.2, 30
     elif page_count <= 200:
-        max_tokens, temperature, timeout = 1600, 0.2, 30
+        max_tokens, temperature, timeout = 1700, 0.2, 30
     else:
-        max_tokens, temperature, timeout = 1500, 0.18, 25
+        max_tokens, temperature, timeout = 1100, 0.12, 25
     total_budget = 3500
     budget_left = max(800, total_budget - ctx_tok)
     return {"max_tokens": min(max_tokens, budget_left), "temperature": temperature, "timeout": timeout}
