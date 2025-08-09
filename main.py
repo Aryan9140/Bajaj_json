@@ -81,6 +81,7 @@ Decision rule:
 
 Requirements:
 - Quote every number, amount, time period, percentage, sub-limit, definition, eligibility, exclusion, waiting period, and condition **word-for-word**.
+- If any numbers or conditions are present in the answer, include at least one short **verbatim** quote from <Context>.
 - If Yes/No, start with “Yes.” or “No.” and immediately quote the rule that makes it so.
 - Include all applicable conditions in a compact way.
 - No clause numbers, no speculation, no invented facts.
@@ -118,13 +119,13 @@ def choose_mistral_params(page_count: int, context_text: Optional[str]):
     # NOTE: keep your budget logic intact
     ctx_tok = approx_tokens_from_text(context_text or "")
     if page_count <= 100:
-        max_tokens, temperature, timeout = 1100, 0.20, 15
+        max_tokens, temperature, timeout = 1000, 0.12, 15
     elif page_count <= 200:
-        max_tokens, temperature, timeout = 1400, 0.22, 15
+        max_tokens, temperature, timeout = 1300, 0.18, 15
     else:
         max_tokens, temperature, timeout = 800, 0.18, 12
     total_budget = 3500
-    budget_left = max(600, total_budget - ctx_tok)
+    budget_left = max(700, total_budget - ctx_tok)
     return {"max_tokens": min(max_tokens, budget_left), "temperature": temperature, "timeout": timeout}
 
 def choose_groq_params(page_count: int, context_text: Optional[str]):
@@ -162,7 +163,13 @@ def extract_text_from_pdf_url(pdf_url: str) -> Tuple[str, int, str]:
                     # SUGGESTION: dpi=120 is often enough; 100 keeps it fast
                     pix = doc[i].get_pixmap(dpi=100)
                     img = Image.open(io.BytesIO(pix.tobytes("png")))
-                    t = pytesseract.image_to_string(img, lang="eng").strip()
+                    # t = pytesseract.image_to_string(img, lang="eng").strip()
+                    try:
+                        t = pytesseract.image_to_string(img, lang="eng+mal").strip()
+                        print("Malayalam OCR result:", t)
+                    except Exception:
+                        t = pytesseract.image_to_string(img, lang="eng").strip()
+
                 except Exception:
                     continue
             if t:
@@ -175,7 +182,7 @@ def extract_text_from_pdf_url(pdf_url: str) -> Tuple[str, int, str]:
                 t = (doc[i].get_text() or "").strip()
                 if not t:
                     try:
-                        pix = doc[i].get_pixmap(dpi=100)
+                        pix = doc[i].get_pixmap(dpi=120)
                         img = Image.open(io.BytesIO(pix.tobytes("png")))
                         t = pytesseract.image_to_string(img, lang="eng").strip()
                     except Exception:
@@ -186,7 +193,7 @@ def extract_text_from_pdf_url(pdf_url: str) -> Tuple[str, int, str]:
     os.remove(tmp_path)
     return (full_text.strip() if page_count <= 200 else "", page_count, title or "Untitled Document")
 
-def split_text(text: str, chunk_size: int = 1200, overlap: int = 150) -> List[str]:
+def split_text(text: str, chunk_size: int = 1500, overlap: int = 200) -> List[str]:
     """
     SUGGESTION:
       - If latency is high, try chunk_size=1500 and overlap=100 (fewer calls).
@@ -199,6 +206,60 @@ def split_text(text: str, chunk_size: int = 1200, overlap: int = 150) -> List[st
         chunks.append(text[start:start + chunk_size])
         start += chunk_size - overlap
     return chunks
+
+def _fast_title_and_snippets_with_ocr(data: bytes) -> tuple[int, str, str]:
+    """
+    Fast path for very large PDFs:
+    - Reads page count.
+    - Extracts text from first 2 pages + last 1 page.
+    - OCR fallback with adaptive DPI (120 → 160 if weak).
+    - Malayalam-aware OCR: lang='eng+mal' (requires 'mal' traineddata).
+    Returns: (page_count, title, tiny_snippets)
+    """
+    page_count = 0
+    title = "Untitled Document"
+    snippets = []
+
+    try:
+        with fitz.open(stream=data, filetype="pdf") as doc:
+            page_count = len(doc)
+            sample_idxs = [i for i in (0, 1, page_count - 1) if 0 <= i < page_count]
+
+            for idx in sample_idxs:
+                page = doc[idx]
+                txt = (page.get_text("text", sort=True) or "").strip()
+
+                if not txt:
+                    # --- OCR pass (adaptive DPI) ---
+                    def _ocr_at_dpi(dpi: int) -> str:
+                        pix = page.get_pixmap(dpi=dpi)
+                        img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("L")
+                        # light upscale helps small glyphs
+                        if img.width < 1500:
+                            img = img.resize((int(img.width * 1.5), int(img.height * 1.5)))
+                        # simple binarization
+                        img = img.point(lambda p: 255 if p > 180 else 0)
+                        return (pytesseract.image_to_string(img, lang="eng+mal") or "").strip()
+
+                    txt = _ocr_at_dpi(120)
+                    # retry if weak (short text or very few digits)
+                    if len(txt) < 400 or sum(ch.isdigit() for ch in txt) < 3:
+                        txt = _ocr_at_dpi(160)
+
+                if idx in (0, 1) and txt and title == "Untitled Document":
+                    title = txt.splitlines()[0][:120]
+
+                if txt:
+                    snippets.append("\n".join(txt.splitlines()[:30])[:1500])
+
+    except Exception:
+        pass
+
+    tiny = ("\n\n---\n\n").join(snippets)[:3000] if snippets else ""
+    return page_count, title, tiny
+
+
+
 
 # ---------------- LLM Calls ----------------
 def call_mistral(prompt: str, params: dict) -> str:
@@ -451,13 +512,6 @@ def _handle_mission_url(data: bytes):
 
 
 
-# --- city -> landmark mapping from your Mission Brief PDF ---
-
-
-
-
-
-
 
 
 # ---- Dynamic city→landmark from mission PDF (no hardcoding) ----
@@ -590,10 +644,15 @@ def _solve_flight_number() -> str:
     return str(flight).strip()
 
 
+import unicodedata
 
-
-
-
+def _clean_pdf_text(s: str) -> str:
+    s = unicodedata.normalize("NFKC", s or "")
+    s = s.replace("\u200c", "").replace("\u200d", "").replace("\ufeff", "")
+    s = "".join(ch for ch in s if ch.isprintable() or ch in "\n\t ")
+    s = re.sub(r"-\s*\n\s*", "", s)     # join hyphenated line-break words
+    s = re.sub(r"[ \t]*\n[ \t]*", "\n", s)
+    return s
 
 
 
@@ -606,23 +665,21 @@ def _solve_flight_number() -> str:
 
 
 
-
-
 @app.get("/")
 def read_root():
-    return {"message": "PDF API is running"}
+    return {"message": "Bajaj Chatbot PDF API is running"}
+
 
 @app.post("/api/v1/hackrx/run")
 async def run_analysis_final(request: RunRequest, authorization: str = Header(...)):
     """
     Final Level-4 route merged into /api/v1/hackrx/run:
     - Handles non-PDF register.hackrx.in URLs (secret token / flight number).
+    - >200 pages: tiny OCR snippets + title → WEB prompt (early return; no full extraction).
     - ≤100 pages: full-context first; auto-recheck any weak/blank answers with focused top-k+neighbors.
     - 101–200 pages: per-question focused context; targeted retries.
-    - >200 pages: title/public path.
     """
     print(f"⏱ Starting run with {len(request.questions)} questions on {request.documents}")
-    
     print(f"Questions: {request.questions}")
     print(f"Documents: {request.documents}")
 
@@ -666,31 +723,40 @@ async def run_analysis_final(request: RunRequest, authorization: str = Header(..
             #   3) Otherwise, nothing to do on this URL
             return {"answers": ["Not found in non-PDF URL."]}
 
-        # Quick PDF meta
-        page_count_fast, title_fast = 0, "Untitled Document"
-        try:
-            with fitz.open(stream=data, filetype="pdf") as doc:
-                page_count_fast = len(doc)
-                first = (doc[0].get_text("text", sort=True) or "").strip() if len(doc) else ""
-                if first:
-                    title_fast = first.splitlines()[0][:120]
-        except Exception:
-            pass
+        # ---------- Ultra-fast tiny OCR + meta for big PDFs (Malayalam-aware) ----------
+        page_count_fast, title_fast, tiny_snippets = _fast_title_and_snippets_with_ocr(data)
 
-        # >200 pages → title/public info path
+        # >200 pages → hybrid path: tiny OCR context + public/web knowledge
         if page_count_fast and page_count_fast > 200:
             try:
                 qblock = make_question_block(request.questions)
-                m_params = choose_mistral_params(page_count_fast, title_fast)
-                resp = call_mistral(WEB_PROMPT_TEMPLATE.format(title=title_fast, query=qblock), m_params)
+
+                # Provide OCR snippets alongside title for WEB prompt grounding
+                hybrid_title = (title_fast or "Untitled Document")
+                if tiny_snippets:
+                    hybrid_title = f"{hybrid_title}\n\nKey OCR snippets:\n{tiny_snippets}"
+
+                m_params = choose_mistral_params(page_count_fast, hybrid_title)
+                # More deterministic on long docs
+                m_params["temperature"] = min(m_params.get("temperature", 0.2), 0.18)
+
+                resp = call_mistral(
+                    WEB_PROMPT_TEMPLATE.format(title=hybrid_title, query=qblock),
+                    m_params
+                )
                 cleaned = [_sanitize_line(ln) for ln in resp.splitlines() if ln.strip()]
                 answers = cleaned[:len(request.questions)] if cleaned else ["Not found in public sources."] * len(request.questions)
+
+                # EARLY RETURN — avoid full extraction for 200+ pages
                 return {"answers": answers}
+
             except Exception:
                 return {"answers": ["Not found in public sources."] * len(request.questions)}
+        # ------------------------------------------------------------------------------
 
         # ≤200: Extract full text
         full_text, page_count, _title = extract_text_from_pdf_url(request.documents)
+        full_text = _clean_pdf_text(full_text)
         chunks = split_text(full_text) if full_text else []
         if not full_text:
             raise HTTPException(status_code=422, detail="Could not extract text from PDF.")
