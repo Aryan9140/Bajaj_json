@@ -105,6 +105,7 @@ Questions:
 Instructions:
 - Use public knowledge.
 - If specific document data is needed, reply: "Not found in public sources."
+- Answer EACH question in the SAME LANGUAGE it is asked (English → English, Malayalam → Malayalam). Do not mix languages across answers.
 - Keep each answer concise (1 paragraph max).
 - Give each answer in a single paragraph without numbering.
 
