@@ -515,7 +515,12 @@ async def run_analysis_final(request: RunRequest, authorization: str = Header(..
     - ≤100 pages: full-context first; auto-recheck any weak/blank answers with focused top-k+neighbors.
     - 101–200 pages: per-question focused context; targeted retries.
     - >200 pages: title/public path.
+
     """
+    print(f"⏱⏱ Starting run for {len(request.questions)} questions on {request.documents}")
+    print(f"⏱⏱ Questions: {request.questions}")
+    print(f"⏱⏱ Documents: {request.documents}")
+    
     if authorization != f"Bearer {API_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -595,6 +600,7 @@ async def run_analysis_final(request: RunRequest, authorization: str = Header(..
             return {"answers": answers[:len(request.questions)]}
 
         # 101–200 pages: per-question focus + retry
+
         elif page_count <= 200:
             out: List[str] = []
             for q in request.questions:
