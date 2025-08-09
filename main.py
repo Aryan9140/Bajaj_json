@@ -208,7 +208,7 @@ def call_mistral(prompt: str, params: dict) -> str:
     headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": "mistral-small-latest",
-        "temperature": params.get("temperature", 0.1),
+        "temperature": params.get("temperature", 0.3),
         "top_p": 1,
         "max_tokens": params.get("max_tokens", 1000),
         "messages": [{"role": "user", "content": prompt}],
@@ -272,7 +272,7 @@ async def call_groq_on_chunks(chunks: List[str], questions: List[str], params: d
         prompt = CHUNK_PROMPT_TEMPLATE.format(context=context, web_snippets="", query=q)
         payload = {
             "model": "meta-llama/llama-4-scout-17b-16e-instruct",
-            "temperature": params.get("temperature", 0.1),
+            "temperature": params.get("temperature", 0.3),
             "top_p": 1,
             "max_tokens": params.get("max_tokens", 1000),
             "messages": [{"role": "user", "content": prompt}],
@@ -332,8 +332,8 @@ async def _retry_per_question(q: str, full_text: str, chunks: List[str], page_co
     """
     # Mistral retry
     try:
-        idxs = _topk_indices(q, chunks, k=7)
-        ctx = _context_with_neighbors(chunks, idxs, neighbor=2, budget_chars=9500)
+        idxs = _topk_indices(q, chunks, k=6)
+        ctx = _context_with_neighbors(chunks, idxs, neighbor=1, budget_chars=9500)
         m_params = choose_mistral_params(page_count, ctx)
         a = _sanitize_line(call_mistral(
             CHUNK_PROMPT_TEMPLATE.format(context=ctx, web_snippets="", query=q),
