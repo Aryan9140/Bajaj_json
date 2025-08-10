@@ -87,7 +87,7 @@ Instructions:
 
 Answers:"""
 
-CHUNK_PROMPT_TEMPLATE = """You are an insurance policy specialist. Prefer answers from the policy <Context>.
+CHUNK_PROMPT_TEMPLATE = """You are an insurance policy specialist. Prefer answers from the policy <Context> only.
 
 Decision rule:
 1) Search ALL of <Context>. If the answer exists there, answer ONLY from <Context>.
@@ -137,7 +137,7 @@ def choose_mistral_params(page_count: int, context_text: Optional[str]):
     # NOTE: keep your budget logic intact
     ctx_tok = approx_tokens_from_text(context_text or "")
     if page_count <= 100:
-        max_tokens, temperature, timeout = 1200, 0.1, 18
+        max_tokens, temperature, timeout = 1100, 0.2, 18
     elif page_count <= 200:
         max_tokens, temperature, timeout = 1300, 0.18, 15
     else:
@@ -302,7 +302,7 @@ def call_mistral_on_chunks(chunks: List[str], questions: List[str], params: dict
 
     sys_msg = (
   "Answer ONLY from <Context>. If not present in <Context>, reply exactly: "
-  "\"Not mentioned in the policy.\" Output one short paragraph, no bullets, no labels. "
+  "\"Not mentioned in the policy.\" Output one not to  short paragraph, no bullets, no labels. "
   "Do NOT infer or add new facts. Answer strictly in the same language as the question."
 )
 
@@ -441,7 +441,7 @@ def _postshape(a: str, target_lang: str) -> str:
 
 async def _retry_per_question(q: str, full_text: str, chunks: List[str], page_count: int) -> str:
     lang_rule = enforce_lang_instruction(q)
-    sys_msg = "Output only the final answer text as one short paragraph. No labels, numbering, bullets, or extra commentary. Answer strictly in the same language as the question."
+    sys_msg = "Output only the final answer text as one not to  short paragraph. No labels, numbering, bullets, or extra commentary. Answer strictly in the same language as the question."
 
     # Mistral retry
     try:
@@ -690,7 +690,7 @@ async def run_analysis_final(request: RunRequest, authorization: str = Header(..
     Final Level-4 route merged into /api/v1/hackrx/run:
     - Handles non-PDF register.hackrx.in URLs (secret token / flight number).
     - >200 pages: tiny OCR snippets + title → WEB prompt (early return; no full extraction).
-    - ≤100 pages: PER-QUESTION flow with language enforcement and guard rewrite.
+    - ≤100 pages: PER-QUESTION flow with language enforcement and guard rewrite ,  not to short paragraph.
     - 101–200 pages: per-question focused context; targeted retries; language enforced.
     """
     print(f"⏱ Starting run with {len(request.questions)} questions on {request.documents}")
@@ -770,7 +770,7 @@ async def run_analysis_final(request: RunRequest, authorization: str = Header(..
                     ctx = _context_with_neighbors(chunks, idxs, neighbor=1, budget_chars=9500)
                     m_params = choose_mistral_params(page_count, ctx)
                     lang_rule = enforce_lang_instruction(q)
-                    sys_msg = "Output only the final answer text as one short paragraph. No labels, numbering, bullets, or extra commentary. Answer strictly in the same language as the question."
+                    sys_msg = "Output only the final answer text as one  not to short paragraph. No labels, numbering, bullets, or extra commentary. Answer strictly in the same language as the question."
                     prompt = CHUNK_PROMPT_TEMPLATE.format(context=ctx, query=q, lang_rule=lang_rule)
                     a = _sanitize_line(call_mistral(prompt, m_params, system=sys_msg))
                     if not a or _is_not_found(a):
@@ -811,7 +811,7 @@ async def run_analysis_final(request: RunRequest, authorization: str = Header(..
                     ctx = _context_with_neighbors(chunks, idxs, neighbor=1, budget_chars=9500)
                     m_params = choose_mistral_params(page_count, ctx)
                     lang_rule = enforce_lang_instruction(q)
-                    sys_msg = "Output only the final answer text as one short paragraph. No labels, numbering, bullets, or extra commentary. Answer strictly in the same language as the question."
+                    sys_msg = "Output only the final answer text as one not to  short paragraph. No labels, numbering, bullets, or extra commentary. Answer strictly in the same language as the question."
                     a = _sanitize_line(call_mistral(
                         CHUNK_PROMPT_TEMPLATE.format(context=ctx, web_snippets="", query=q, lang_rule=lang_rule),
                         m_params,
