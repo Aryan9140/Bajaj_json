@@ -127,6 +127,8 @@ Instructions:
 Answers:"""
 
 # ---------------- Helpers ----------------
+
+
 def approx_tokens_from_text(s: str) -> int:
     # crude estimate: ~4 chars/token
     return max(1, len(s) // 4)
@@ -135,11 +137,11 @@ def choose_mistral_params(page_count: int, context_text: Optional[str]):
     # NOTE: keep your budget logic intact
     ctx_tok = approx_tokens_from_text(context_text or "")
     if page_count <= 100:
-        max_tokens, temperature, timeout = 1000, 0.12, 15
+        max_tokens, temperature, timeout = 800, 0.1, 18
     elif page_count <= 200:
         max_tokens, temperature, timeout = 1300, 0.18, 15
     else:
-        max_tokens, temperature, timeout = 800, 0.18, 12
+        max_tokens, temperature, timeout = 700, 0.18, 12
     total_budget = 3500
     budget_left = max(700, total_budget - ctx_tok)
     return {"max_tokens": min(max_tokens, budget_left), "temperature": temperature, "timeout": timeout}
@@ -147,7 +149,7 @@ def choose_mistral_params(page_count: int, context_text: Optional[str]):
 def choose_groq_params(page_count: int, context_text: Optional[str]):
     ctx_tok = approx_tokens_from_text(context_text or "")
     if page_count <= 100:
-        max_tokens, temperature, timeout = 1300, 0.2, 30
+        max_tokens, temperature, timeout = 1100, 0.0, 30
     elif page_count <= 200:
         max_tokens, temperature, timeout = 1700, 0.2, 30
     else:
@@ -176,7 +178,7 @@ def extract_text_from_pdf_url(pdf_url: str) -> Tuple[str, int, str]:
             t = (doc[i].get_text() or "").strip()
             if not t:
                 try:
-                    pix = doc[i].get_pixmap(dpi=100)
+                    pix = doc[i].get_pixmap(dpi=120)
                     img = Image.open(io.BytesIO(pix.tobytes("png")))
                     try:
                         t = pytesseract.image_to_string(img, lang="eng+mal").strip()
@@ -206,7 +208,7 @@ def extract_text_from_pdf_url(pdf_url: str) -> Tuple[str, int, str]:
     os.remove(tmp_path)
     return (full_text.strip() if page_count <= 200 else "", page_count, title or "Untitled Document")
 
-def split_text(text: str, chunk_size: int = 1300, overlap: int = 200) -> List[str]:
+def split_text(text: str, chunk_size: int = 1300, overlap: int = 300) -> List[str]:
     chunks, start = [], 0
     n = len(text)
     while start < n and len(chunks) < 15:
