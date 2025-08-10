@@ -206,7 +206,7 @@ def extract_text_from_pdf_url(pdf_url: str) -> Tuple[str, int, str]:
     os.remove(tmp_path)
     return (full_text.strip() if page_count <= 200 else "", page_count, title or "Untitled Document")
 
-def split_text(text: str, chunk_size: int = 1500, overlap: int = 200) -> List[str]:
+def split_text(text: str, chunk_size: int = 1300, overlap: int = 200) -> List[str]:
     chunks, start = [], 0
     n = len(text)
     while start < n and len(chunks) < 15:
@@ -258,7 +258,7 @@ def call_mistral(prompt: str, params: dict, system: Optional[str] = None) -> str
         "model": "mistral-small-latest",
         "temperature": params.get("temperature", 0.3),
         "top_p": 1,
-        "max_tokens": params.get("max_tokens", 1000),
+        "max_tokens": params.get("max_tokens", 1100),
         "messages": messages,
     }
     r = REQUESTS_SESSION.post(url, headers=headers, json=payload, timeout=params.get("timeout", 15))
@@ -295,8 +295,22 @@ def _harvest_numeric_lines(text: str, max_lines: int = 60) -> str:
 
 def call_mistral_on_chunks(chunks: List[str], questions: List[str], params: dict) -> List[str]:
     answers = []
-    sys_msg = "Follow instructions exactly. Never change the language of the answer from the question's language."
+
+    # sys_msg = "Follow instructions exactly. Never change the language of the answer from the question's language."
+
+    sys_msg = (
+  "Answer ONLY from <Context>. If not present in <Context>, reply exactly: "
+  "\"Not mentioned in the policy.\" Output one short paragraph, no bullets, no labels. "
+  "Do NOT infer or add new facts. Answer strictly in the same language as the question."
+)
+
+    
+
+
+
+
     for q in questions:
+
         kchunks = _topk_chunks(q, chunks, k=4) or chunks[:4]
         combined = "\n\n".join(kchunks)
         evidence = _harvest_numeric_lines(combined)
