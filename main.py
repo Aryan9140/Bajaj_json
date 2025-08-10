@@ -304,10 +304,6 @@ def call_mistral_on_chunks(chunks: List[str], questions: List[str], params: dict
   "Do NOT infer or add new facts. Answer strictly in the same language as the question."
 )
 
-    
-
-
-
 
     for q in questions:
 
