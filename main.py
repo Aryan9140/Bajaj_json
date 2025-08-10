@@ -1,25 +1,23 @@
-# main.py — PDF QA API (Level-4 route added)
+# main.py — PDF QA API (Level-4 route + language-aware answers)
 # Run: uvicorn main:app --host 0.0.0.0 --port 8000
 # Env: API_TOKEN (required), MISTRAL_API_KEY (optional), GROQ_API_KEY (optional)
-# NOTE: No extra deps beyond your current stack; prompts / models unchanged.
 
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from typing import List, Tuple, Optional
-import os, tempfile, io, time, re
+import os, tempfile, io, time, re, json, asyncio, collections, unicodedata
 import fitz  # PyMuPDF
 from PIL import Image
 import pytesseract
 import requests, httpx
-import asyncio
 from dotenv import load_dotenv
-
-# ---------------- App & Clients ----------------
-app = FastAPI()
-
+from urllib.parse import urlparse
 import urllib3
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+# ---------------- App & Clients ----------------
+app = FastAPI()
 
 REQUESTS_SESSION = requests.Session()
 REQUESTS_SESSION.headers.update({"Accept-Encoding": "gzip, deflate"})
@@ -55,6 +53,23 @@ class RunRequest(BaseModel):
     documents: str
     questions: List[str]
 
+# ---------------- Language helpers ----------------
+# ---------------- Language helpers ----------------
+def is_malayalam(s: str) -> bool:
+    return any(0x0D00 <= ord(ch) <= 0x0D7F for ch in (s or ""))
+
+def question_lang_label(q: str) -> str:
+    return "Malayalam" if is_malayalam(q) else "English"
+
+def enforce_lang_instruction(q: str) -> str:
+    return (
+        f"IMPORTANT: Answer in the SAME language as THIS question: {question_lang_label(q)}. "
+        f"Do NOT switch languages."
+    )
+
+
+DEFAULT_LANG_RULE = "Answer in the same language as the question."
+
 # ---------------- Prompts ----------------
 FULL_PROMPT_TEMPLATE = """You are an insurance policy expert. Use ONLY the information provided in the context to answer the questions.
 Context:
@@ -78,6 +93,7 @@ Decision rule:
 1) Search ALL of <Context>. If the answer exists there, answer ONLY from <Context>.
 2) If the answer is NOT in <Context>, reply exactly: "Not mentioned in the policy."
 3) Answer in the SAME LANGUAGE as the question.
+4) {lang_rule}
 
 Requirements:
 - Quote every number, amount, time period, percentage, sub-limit, definition, eligibility, exclusion, waiting period, and condition **word-for-word**.
@@ -94,7 +110,6 @@ Questions:
 
 Answers (one concise paragraph per question, no bullets, no numbering):
 """
-
 
 WEB_PROMPT_TEMPLATE = """You are an expert insurance policy assistant. Based on the document titled "{title}", answer the following questions using general or public insurance knowledge.
 Title: "{title}"
@@ -161,16 +176,13 @@ def extract_text_from_pdf_url(pdf_url: str) -> Tuple[str, int, str]:
             t = (doc[i].get_text() or "").strip()
             if not t:
                 try:
-                    # SUGGESTION: dpi=120 is often enough; 100 keeps it fast
                     pix = doc[i].get_pixmap(dpi=100)
                     img = Image.open(io.BytesIO(pix.tobytes("png")))
-                    # t = pytesseract.image_to_string(img, lang="eng").strip()
                     try:
                         t = pytesseract.image_to_string(img, lang="eng+mal").strip()
                         print("Malayalam OCR result:", t)
                     except Exception:
                         t = pytesseract.image_to_string(img, lang="eng").strip()
-
                 except Exception:
                     continue
             if t:
@@ -195,90 +207,66 @@ def extract_text_from_pdf_url(pdf_url: str) -> Tuple[str, int, str]:
     return (full_text.strip() if page_count <= 200 else "", page_count, title or "Untitled Document")
 
 def split_text(text: str, chunk_size: int = 1500, overlap: int = 200) -> List[str]:
-    """
-    SUGGESTION:
-      - If latency is high, try chunk_size=1500 and overlap=100 (fewer calls).
-      - If accuracy needs a bit more, try overlap=200–250.
-    """
     chunks, start = [], 0
     n = len(text)
-    # SUGGESTION: cap chunks to ~15 for latency; your code already does that
     while start < n and len(chunks) < 15:
         chunks.append(text[start:start + chunk_size])
         start += chunk_size - overlap
     return chunks
 
 def _fast_title_and_snippets_with_ocr(data: bytes) -> tuple[int, str, str]:
-    """
-    Fast path for very large PDFs:
-    - Reads page count.
-    - Extracts text from first 2 pages + last 1 page.
-    - OCR fallback with adaptive DPI (120 → 160 if weak).
-    - Malayalam-aware OCR: lang='eng+mal' (requires 'mal' traineddata).
-    Returns: (page_count, title, tiny_snippets)
-    """
     page_count = 0
     title = "Untitled Document"
     snippets = []
-
     try:
         with fitz.open(stream=data, filetype="pdf") as doc:
             page_count = len(doc)
             sample_idxs = [i for i in (0, 1, page_count - 1) if 0 <= i < page_count]
-
             for idx in sample_idxs:
                 page = doc[idx]
                 txt = (page.get_text("text", sort=True) or "").strip()
-
                 if not txt:
-                    # --- OCR pass (adaptive DPI) ---
                     def _ocr_at_dpi(dpi: int) -> str:
                         pix = page.get_pixmap(dpi=dpi)
                         img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("L")
-                        # light upscale helps small glyphs
                         if img.width < 1500:
                             img = img.resize((int(img.width * 1.5), int(img.height * 1.5)))
-                        # simple binarization
                         img = img.point(lambda p: 255 if p > 180 else 0)
                         return (pytesseract.image_to_string(img, lang="eng+mal") or "").strip()
-
                     txt = _ocr_at_dpi(120)
-                    # retry if weak (short text or very few digits)
                     if len(txt) < 400 or sum(ch.isdigit() for ch in txt) < 3:
                         txt = _ocr_at_dpi(160)
-
                 if idx in (0, 1) and txt and title == "Untitled Document":
                     title = txt.splitlines()[0][:120]
-
                 if txt:
                     snippets.append("\n".join(txt.splitlines()[:30])[:1500])
-
     except Exception:
         pass
-
     tiny = ("\n\n---\n\n").join(snippets)[:3000] if snippets else ""
     return page_count, title, tiny
 
-
-
-
 # ---------------- LLM Calls ----------------
-def call_mistral(prompt: str, params: dict) -> str:
+
+def call_mistral(prompt: str, params: dict, system: Optional[str] = None) -> str:
     url = "https://api.mistral.ai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
     payload = {
         "model": "mistral-small-latest",
         "temperature": params.get("temperature", 0.3),
         "top_p": 1,
         "max_tokens": params.get("max_tokens", 1000),
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
     }
     r = REQUESTS_SESSION.post(url, headers=headers, json=payload, timeout=params.get("timeout", 15))
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
+
 def _score_chunk(q: str, c: str) -> int:
-    # NOTE: simple lexical+number overlap; kept your logic to avoid extra deps.
     WORD_RX = re.compile(r"\w+")
     NUM_RX  = re.compile(r"\d+%?")
     qt = set(WORD_RX.findall(q.lower()))
@@ -298,7 +286,6 @@ KEY_LINE_RX = re.compile(
 )
 
 def _harvest_numeric_lines(text: str, max_lines: int = 60) -> str:
-    # NOTE: helps the model quote numbers verbatim
     seen, out = set(), []
     for ln in (l.strip() for l in text.splitlines() if l.strip()):
         if KEY_LINE_RX.search(ln) and ln not in seen:
@@ -308,34 +295,40 @@ def _harvest_numeric_lines(text: str, max_lines: int = 60) -> str:
 
 def call_mistral_on_chunks(chunks: List[str], questions: List[str], params: dict) -> List[str]:
     answers = []
+    sys_msg = "Follow instructions exactly. Never change the language of the answer from the question's language."
     for q in questions:
         kchunks = _topk_chunks(q, chunks, k=4) or chunks[:4]
         combined = "\n\n".join(kchunks)
         evidence = _harvest_numeric_lines(combined)
         context = combined + (f"\n\n--- Evidence ---\n{evidence}" if evidence else "")
-        prompt = CHUNK_PROMPT_TEMPLATE.format(context=context, web_snippets="", query=q)
-        ans = call_mistral(prompt, params).strip()
+        lang_rule = enforce_lang_instruction(q)
+        prompt = CHUNK_PROMPT_TEMPLATE.format(context=context, web_snippets="", query=q, lang_rule=lang_rule)
+        ans = call_mistral(prompt, params, system=sys_msg).strip()
         answers.append(ans)
     return answers
 
 async def call_groq_on_chunks(chunks: List[str], questions: List[str], params: dict) -> List[str]:
-    # single-batch (one prompt per question) using top-k chunks too
     answers = []
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     url = "https://api.groq.com/openai/v1/chat/completions"
+    sys_msg = "Follow instructions exactly. Never change the language of the answer from the question's language."
 
     async def ask(q: str):
         kchunks = _topk_chunks(q, chunks, k=4) or chunks[:4]
         combined = "\n\n".join(kchunks)
         evidence = _harvest_numeric_lines(combined)
         context = combined + (f"\n\n--- Evidence ---\n{evidence}" if evidence else "")
-        prompt = CHUNK_PROMPT_TEMPLATE.format(context=context, web_snippets="", query=q)
+        lang_rule = enforce_lang_instruction(q)
+        prompt = CHUNK_PROMPT_TEMPLATE.format(context=context, web_snippets="", query=q, lang_rule=lang_rule)
         payload = {
             "model": "meta-llama/llama-4-scout-17b-16e-instruct",
             "temperature": params.get("temperature", 0.3),
             "top_p": 1,
             "max_tokens": params.get("max_tokens", 1000),
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": prompt}
+            ],
         }
         r = await ASYNC_CLIENT.post(url, headers=headers, json=payload, timeout=params.get("timeout", 20))
         r.raise_for_status()
@@ -345,7 +338,9 @@ async def call_groq_on_chunks(chunks: List[str], questions: List[str], params: d
     answers.extend(results)
     return answers
 
-# ---------------- Level-4 helpers (added) ----------------
+# ---------------- Level-4 helpers ----------------
+
+
 _NOT_FOUND_RX = re.compile(r"^\s*not\s+mentioned\s+in\s+the\s+policy\.?\s*$", re.I)
 
 def _sanitize_line(s: str) -> str:
@@ -358,12 +353,10 @@ def _is_not_found(s: str) -> bool:
     return bool(_NOT_FOUND_RX.match((s or "").strip()))
 
 def _topk_indices(q: str, chunks: List[str], k: int = 5) -> List[int]:
-    # SUGGESTION: for slightly better recall, set k=6 when latency allows
     scored = sorted(((i, _score_chunk(q, c)) for i, c in enumerate(chunks)), key=lambda x: x[1], reverse=True)
     return [i for i, _ in scored[:k]]
 
 def _context_with_neighbors(chunks: List[str], idxs: List[int], neighbor: int = 1, budget_chars: int = 9000) -> str:
-    # collect top matches with ±neighbor chunks, respecting a char budget
     want = set()
     for i in idxs:
         for j in range(max(0, i - neighbor), min(len(chunks), i + neighbor + 1)):
@@ -378,31 +371,81 @@ def _context_with_neighbors(chunks: List[str], idxs: List[int], neighbor: int = 
             break
         buf.append(seg)
         used += len(seg) + 2
-    # numeric/limit lines to help the model quote exact numbers
     evidence = _harvest_numeric_lines("\n\n".join(buf), max_lines=120)
     if evidence:
         buf.append("\n--- Evidence ---\n" + evidence)
     return "\n\n".join(buf)
 
+
+# --- Formatting helpers (leaderboard-friendly) ---
+
+# --- Formatting helpers (leaderboard-friendly) ---
+_MAL = r"\u0D00-\u0D7F"
+
+def _unescape_quotes(s: str) -> str:
+    s = s.replace('\\"', '"').replace("\\'", "'")
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1].strip()
+    return s
+
+def _strip_meta_lines(s: str) -> str:
+    bad = [
+        r"^\s*no direct quote.*$",
+        r"^\s*related verbatim quote.*$",
+        r"^\s*note:.*$",
+        r"^\s*explanation:.*$",
+    ]
+    for rx in bad:
+        s = re.sub(rx, "", s, flags=re.I | re.M)
+    return s
+
+def _single_paragraph(s: str) -> str:
+    s = s.replace("\r", " ")
+    s = re.sub(r"\s*\n\s*", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+def _fix_malayalam_spacing(s: str) -> str:
+    s = re.sub(rf"([{_MAL}])(\d)", r"\1 \2", s)
+    s = re.sub(rf"(\d)([{_MAL}])", r"\1 \2", s)
+    s = re.sub(r"(\d)\s*%", r"\1 %", s)
+    s = re.sub(rf"([{_MAL}])\s*(\d+)\s*-\s*([{_MAL}])", r"\1 \2-\3", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _postshape(a: str, target_lang: str) -> str:
+    a = (a or "").strip()
+    a = _unescape_quotes(a)
+    a = _strip_meta_lines(a)
+    a = _single_paragraph(a)
+    if (a.startswith('"') and a.endswith('"')) or (a.startswith("'") and a.endswith("'")):
+        a = a[1:-1].strip()
+    a = a.rstrip(" .")
+    if target_lang == "Malayalam":
+        a = _fix_malayalam_spacing(a)
+    return a
+
+
+
 async def _retry_per_question(q: str, full_text: str, chunks: List[str], page_count: int) -> str:
-    """
-    Focused retry for weak/blank answers:
-      1) Mistral with top-k + neighbors context
-      2) Groq fallback with same idea
-    """
+    lang_rule = enforce_lang_instruction(q)
+    sys_msg = "Output only the final answer text as one short paragraph. No labels, numbering, bullets, or extra commentary. Answer strictly in the same language as the question."
+
     # Mistral retry
     try:
         idxs = _topk_indices(q, chunks, k=6)
         ctx = _context_with_neighbors(chunks, idxs, neighbor=1, budget_chars=9500)
         m_params = choose_mistral_params(page_count, ctx)
         a = _sanitize_line(call_mistral(
-            CHUNK_PROMPT_TEMPLATE.format(context=ctx, web_snippets="", query=q),
-            m_params
+            CHUNK_PROMPT_TEMPLATE.format(context=ctx, query=q, lang_rule=lang_rule),
+            m_params,
+            system=sys_msg
         ))
         if a and not _is_not_found(a):
-            return a
+            return _postshape(a, question_lang_label(q))
     except Exception:
         pass
+
     # Groq fallback
     try:
         g_params = choose_groq_params(page_count, "\n".join(chunks[:10]))
@@ -410,20 +453,28 @@ async def _retry_per_question(q: str, full_text: str, chunks: List[str], page_co
         combined = "\n\n".join(kchunks)
         evidence = _harvest_numeric_lines(combined)
         ctx2 = combined + (f"\n\n--- Evidence ---\n{evidence}" if evidence else "")
-        outs = await call_groq_on_chunks([ctx2], [q], g_params)
-        a2 = _sanitize_line((outs[0] if outs else "") or "")
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        payload = {
+            "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+            "temperature": g_params.get("temperature", 0.3),
+            "top_p": 1,
+            "max_tokens": g_params.get("max_tokens", 1000),
+            "messages": [
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": CHUNK_PROMPT_TEMPLATE.format(context=ctx2, query=q, lang_rule=lang_rule)}
+            ],
+        }
+        r = await ASYNC_CLIENT.post(url, headers=headers, json=payload, timeout=g_params.get("timeout", 20))
+        r.raise_for_status()
+        a2 = _sanitize_line(r.json()["choices"][0]["message"]["content"].strip())
         if a2:
-            return a2
+            return _postshape(a2, question_lang_label(q))
     except Exception:
         pass
+
     return "Not mentioned in the policy."
 
-
-
-
-
-import json
-from urllib.parse import urlparse
 
 # --- detect PDF vs mission URL ---
 def _is_pdf_payload(data: bytes, ctype: str) -> bool:
@@ -454,53 +505,37 @@ def _extract_token_from_json(js):
                 return t
     return None
 
-# Matches:
-#  - labeled tokens: token: <value>, secret token = <value>, key:<value>
-#  - <code>/<pre> wrapped values
-#  - unlabeled but clearly token-ish long hex/base64-ish strings, esp. near 'Secret Token'
 _TOKEN_LABELED_RX = re.compile(
     r'(?:(?:secret\s*token|secretToken|token|api[_\s-]*key|apikey|key)\s*[:=]\s*["\']?)([A-Za-z0-9._\-]{16,})',
     re.I
 )
 _TOKEN_CODE_RX = re.compile(r'<(?:code|pre)[^>]*>\s*([^<>\s]{16,})\s*</(?:code|pre)>', re.I | re.S)
-# Long hex (like your example), or long base64/ID tokens (avoid matching 'device-width')
 _TOKEN_UNLABELED_HEX_RX = re.compile(r'(?<![A-Za-z0-9])[A-Fa-f0-9]{32,128}(?![A-Za-z0-9])')
 _TOKEN_UNLABELED_B64ish_RX = re.compile(r'(?<![A-Za-z0-9])[A-Za-z0-9._\-]{24,256}(?![A-Za-z0-9])')
 
 def _extract_token_from_text(text: str):
     text = (text or "").strip()
-
-    # Prefer labeled forms
     m = _TOKEN_LABELED_RX.search(text)
     if m:
         cand = m.group(1).strip()
         if cand.lower() != "device-width":
             return cand
-
-    # <code>/<pre> blocks
     m = _TOKEN_CODE_RX.search(text)
     if m:
         cand = m.group(1).strip()
         if cand.lower() != "device-width":
             return cand
-
-    # If the page explicitly mentions "Secret Token", look around it for an unlabeled token-ish value
     if re.search(r'secret\s*token', text, re.I):
-        # try a long hex first
         m = _TOKEN_UNLABELED_HEX_RX.search(text)
         if m:
             return m.group(0)
-        # then a long id/base64-ish, but filter obvious viewport artifacts
         for m in _TOKEN_UNLABELED_B64ish_RX.finditer(text):
             cand = m.group(0)
             if cand.lower() != "device-width":
                 return cand
-
-    # Otherwise, do NOT guess to avoid false positives like "device-width"
     return None
 
 def _handle_mission_url(data: bytes):
-    # try JSON
     try:
         js = json.loads(data.decode("utf-8", errors="ignore"))
         t = _extract_token_from_json(js)
@@ -508,21 +543,10 @@ def _handle_mission_url(data: bytes):
             return t
     except Exception:
         pass
-    # fallback HTML/text
     return _extract_token_from_text(data.decode("utf-8", errors="ignore"))
 
-
-
-
-
-# ---- Dynamic city→landmark from mission PDF (no hardcoding) ----
-# ---- Dynamic city→landmark from mission PDF (no hardcoding) ----
-# ---- City ↔ Landmark per the PDF (no public knowledge, no LLM) ----
-import re, time, collections
-
-# Exactly as in the PDF (order matters: first match wins when a city repeats)
+# ---- City ↔ Landmark (from PDF list) ----
 _LANDMARK_CITY_ROWS = [
-    # Indian Cities (Page 1)
     ("Gateway of India", "Delhi"),
     ("India Gate", "Mumbai"),
     ("Charminar", "Chennai"),
@@ -530,8 +554,6 @@ _LANDMARK_CITY_ROWS = [
     ("Howrah Bridge", "Ahmedabad"),
     ("Golconda Fort", "Mysuru"),
     ("Qutub Minar", "Kochi"),
-
-    # Continued (Page 2)
     ("Taj Mahal", "Hyderabad"),
     ("Meenakshi Temple", "Pune"),
     ("Lotus Temple", "Nagpur"),
@@ -541,8 +563,6 @@ _LANDMARK_CITY_ROWS = [
     ("Vidhana Soudha", "Varanasi"),
     ("Sun Temple", "Jaisalmer"),
     ("Golden Temple", "Pune"),
-
-    # International Cities (Page 2)
     ("Eiffel Tower", "New York"),
     ("Statue of Liberty", "London"),
     ("Big Ben", "Tokyo"),
@@ -560,8 +580,6 @@ _LANDMARK_CITY_ROWS = [
     ("Sagrada Familia", "Seoul"),
     ("Acropolis", "Cape Town"),
     ("Big Ben", "Istanbul"),
-
-    # Page 3 examples (not needed for route rules, but included for completeness)
     ("Machu Picchu", "Riyadh"),
     ("Taj Mahal", "Paris"),
     ("Moai Statues", "Dubai Airport"),
@@ -577,7 +595,6 @@ _LANDMARK_CITY_ROWS = [
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).casefold()
 
-# Build CITY -> LANDMARK (first row wins)
 _CITY_TO_LANDMARK = {}
 for lmk, city in _LANDMARK_CITY_ROWS:
     k = _norm(city)
@@ -608,7 +625,6 @@ def _get_city_once() -> str:
         return (r1.text or "").strip().strip('"').strip()
 
 def _solve_flight_number() -> str:
-    # Stabilize the favourite city (majority vote across 3 quick reads)
     cities = []
     for _ in range(3):
         cities.append(_get_city_once())
@@ -616,20 +632,13 @@ def _solve_flight_number() -> str:
     city = max(collections.Counter(cities).items(), key=lambda kv: kv[1])[0].strip()
     if not city:
         raise RuntimeError("Favourite city not returned")
-
-    # Look up landmark strictly via the PDF list (no public/world knowledge)
     landmark = _CITY_TO_LANDMARK.get(_norm(city), "")
-
-    # Pick endpoint by landmark (Eiffel -> Third, etc.), else Fifth
     route = _flight_endpoint_for_landmark(landmark)
     f_url = f"https://register.hackrx.in/teams/public/flights/{route}"
     print(f"[Level-4] City={city} | Landmark={landmark or 'N/A'} | Route={route} | URL={f_url}")
-
-    # Call and return the live ticket number
     r2 = REQUESTS_SESSION.get(f_url, timeout=12, headers={"Accept": "application/json"})
     r2.raise_for_status()
     print(f"[Level-4] GET {f_url} → {r2.text[:200]}")
-
     try:
         j2 = r2.json() or {}
         data2 = j2.get("data") if isinstance(j2.get("data"), dict) else j2
@@ -639,27 +648,17 @@ def _solve_flight_number() -> str:
             flight = m.group(1) if m else ""
     except Exception:
         flight = (r2.text or "").strip().strip('"').strip()
-
     if not flight:
         raise RuntimeError(f"Flight number missing; raw: {r2.text[:300]}")
     return str(flight).strip()
-
-
-import unicodedata
 
 def _clean_pdf_text(s: str) -> str:
     s = unicodedata.normalize("NFKC", s or "")
     s = s.replace("\u200c", "").replace("\u200d", "").replace("\ufeff", "")
     s = "".join(ch for ch in s if ch.isprintable() or ch in "\n\t ")
-    s = re.sub(r"-\s*\n\s*", "", s)     # join hyphenated line-break words
+    s = re.sub(r"-\s*\n\s*", "", s)
     s = re.sub(r"[ \t]*\n[ \t]*", "\n", s)
     return s
-
-
-
-
-
-
 
 
 # ---------------- Routes ----------------
@@ -671,14 +670,16 @@ def read_root():
     return {"message": "Bajaj Chatbot PDF API is running"}
 
 
+
+
 @app.post("/api/v1/hackrx/run")
 async def run_analysis_final(request: RunRequest, authorization: str = Header(...)):
     """
     Final Level-4 route merged into /api/v1/hackrx/run:
     - Handles non-PDF register.hackrx.in URLs (secret token / flight number).
     - >200 pages: tiny OCR snippets + title → WEB prompt (early return; no full extraction).
-    - ≤100 pages: full-context first; auto-recheck any weak/blank answers with focused top-k+neighbors.
-    - 101–200 pages: per-question focused context; targeted retries.
+    - ≤100 pages: PER-QUESTION flow with language enforcement and guard rewrite.
+    - 101–200 pages: per-question focused context; targeted retries; language enforced.
     """
     print(f"⏱ Starting run with {len(request.questions)} questions on {request.documents}")
     print(f"Questions: {request.questions}")
@@ -708,98 +709,114 @@ async def run_analysis_final(request: RunRequest, authorization: str = Header(..
         # Detect PDF vs mission URL
         is_pdf = _is_pdf_payload(data, ctype)
         if not is_pdf and _is_mission_host(request.documents):
-            # Mission URLs:
-            #   1) If asking flight/ticket number, solve first (already early-escaped, but keep as safety)
             if re.search(r"\b(flight|ticket)\s*(no\.?|number)\b", qtext):
                 try:
                     return {"answers": [_solve_flight_number()]}
                 except Exception as e:
                     raise HTTPException(status_code=502, detail=f"Flight solver failed: {e}")
-
-            #   2) If asking token/secret/key, extract token; otherwise don't guess
             if any(x in qtext for x in ("token", "secret", "api key", "apikey", "key")):
                 token = _handle_mission_url(data)
                 return {"answers": [token] if token else ["Not found in non-PDF URL."]}
-
-            #   3) Otherwise, nothing to do on this URL
             return {"answers": ["Not found in non-PDF URL."]}
 
-        # ---------- Ultra-fast tiny OCR + meta for big PDFs (Malayalam-aware) ----------
+        # ---------- Ultra-fast tiny OCR + meta for big PDFs ----------
         page_count_fast, title_fast, tiny_snippets = _fast_title_and_snippets_with_ocr(data)
 
         # >200 pages → hybrid path: tiny OCR context + public/web knowledge
         if page_count_fast and page_count_fast > 200:
             try:
                 qblock = make_question_block(request.questions)
-
-                # Provide OCR snippets alongside title for WEB prompt grounding
                 hybrid_title = (title_fast or "Untitled Document")
                 if tiny_snippets:
                     hybrid_title = f"{hybrid_title}\n\nKey OCR snippets:\n{tiny_snippets}"
-
                 m_params = choose_mistral_params(page_count_fast, hybrid_title)
-                # More deterministic on long docs
                 m_params["temperature"] = min(m_params.get("temperature", 0.2), 0.18)
-
                 resp = call_mistral(
                     WEB_PROMPT_TEMPLATE.format(title=hybrid_title, query=qblock),
                     m_params
                 )
                 cleaned = [_sanitize_line(ln) for ln in resp.splitlines() if ln.strip()]
                 answers = cleaned[:len(request.questions)] if cleaned else ["Not found in public sources."] * len(request.questions)
-
-                # EARLY RETURN — avoid full extraction for 200+ pages
                 return {"answers": answers}
-
             except Exception:
                 return {"answers": ["Not found in public sources."] * len(request.questions)}
-        # ------------------------------------------------------------------------------
+        # ----------------------------------------------------------------
 
         # ≤200: Extract full text
         full_text, page_count, _title = extract_text_from_pdf_url(request.documents)
         full_text = _clean_pdf_text(full_text)
-        chunks = split_text(full_text) if full_text else []
         if not full_text:
             raise HTTPException(status_code=422, detail="Could not extract text from PDF.")
+        chunks = split_text(full_text) if full_text else []
 
-        # ≤100 pages: full context first, retry blanks
+        # ≤100 pages: PER-QUESTION flow (language enforced + guard rewrite)
         if page_count <= 100:
             answers: List[str] = []
-            try:
-                m_params = choose_mistral_params(page_count, full_text)
-                resp = call_mistral(
-                    FULL_PROMPT_TEMPLATE.format(context=full_text, query=make_question_block(request.questions)),
-                    m_params
-                )
-                answers = [_sanitize_line(a) for a in resp.split("\n") if a.strip()]
-            except Exception:
-                answers = []
+            for q in request.questions:
+                try:
+                    idxs = _topk_indices(q, chunks, k=6)
+                    ctx = _context_with_neighbors(chunks, idxs, neighbor=1, budget_chars=9500)
+                    m_params = choose_mistral_params(page_count, ctx)
+                    lang_rule = enforce_lang_instruction(q)
+                    sys_msg = "Output only the final answer text as one short paragraph. No labels, numbering, bullets, or extra commentary. Answer strictly in the same language as the question."
+                    prompt = CHUNK_PROMPT_TEMPLATE.format(context=ctx, query=q, lang_rule=lang_rule)
+                    a = _sanitize_line(call_mistral(prompt, m_params, system=sys_msg))
+                    if not a or _is_not_found(a):
+                        a = await _retry_per_question(q, full_text, chunks, page_count)
+                except Exception:
+                    a = await _retry_per_question(q, full_text, chunks, page_count)
 
-            while len(answers) < len(request.questions):
-                answers.append("")
+                # Final language guard: quick rewrite if the model slips
+                try:
+                    target_lang = question_lang_label(q)
+                    if target_lang == "Malayalam" and not is_malayalam(a):
+                        a = _sanitize_line(call_mistral(
+                            f"Rewrite the following answer in Malayalam without adding new facts:\n\n{a}",
+                            {"max_tokens": 300, "temperature": 0.0, "timeout": 10},
+                            system="Output only the rewritten answer text."
+                        ))
+                    elif target_lang == "English" and is_malayalam(a):
+                        a = _sanitize_line(call_mistral(
+                            f"Rewrite the following answer in English without adding new facts:\n\n{a}",
+                            {"max_tokens": 300, "temperature": 0.0, "timeout": 10},
+                            system="Output only the rewritten answer text."
+                        ))
+                except Exception:
+                    pass
 
-            for i, q in enumerate(request.questions):
-                if not answers[i] or _is_not_found(answers[i]):
-                    answers[i] = await _retry_per_question(q, full_text, chunks, page_count)
+                # >>> Postshape for clean, leaderboard-friendly formatting <<<
+                a = _postshape(a, question_lang_label(q))
+                answers.append(a)
 
             return {"answers": answers[:len(request.questions)]}
 
-        # 101–200 pages: per-question focus + retry
+        # 101–200 pages: per-question focus + retry (language enforced)
         elif page_count <= 200:
             out: List[str] = []
             for q in request.questions:
                 try:
-                    idxs = _topk_indices(q, chunks, k=6)  # reduce k for speed
+                    idxs = _topk_indices(q, chunks, k=6)
                     ctx = _context_with_neighbors(chunks, idxs, neighbor=1, budget_chars=9500)
                     m_params = choose_mistral_params(page_count, ctx)
-                    a = _sanitize_line(
-                        call_mistral(CHUNK_PROMPT_TEMPLATE.format(context=ctx, web_snippets="", query=q), m_params)
-                    )
+                    lang_rule = enforce_lang_instruction(q)
+                    sys_msg = "Output only the final answer text as one short paragraph. No labels, numbering, bullets, or extra commentary. Answer strictly in the same language as the question."
+                    a = _sanitize_line(call_mistral(
+                        CHUNK_PROMPT_TEMPLATE.format(context=ctx, web_snippets="", query=q, lang_rule=lang_rule),
+                        m_params,
+                        system=sys_msg
+                    ))
                     if not a or _is_not_found(a):
                         a = await _retry_per_question(q, full_text, chunks, page_count)
+
+                    # >>> Postshape before appending <<<
+                    a = _postshape(a, question_lang_label(q))
                     out.append(a)
+
                 except Exception:
-                    out.append(await _retry_per_question(q, full_text, chunks, page_count))
+                    # >>> Postshape even on retry path <<<
+                    tmp = await _retry_per_question(q, full_text, chunks, page_count)
+                    out.append(_postshape(tmp, question_lang_label(q)))
+
             return {"answers": out}
 
         return {"answers": ["Not found in public sources."] * len(request.questions)}
@@ -810,3 +827,4 @@ async def run_analysis_final(request: RunRequest, authorization: str = Header(..
         raise HTTPException(status_code=500, detail=f"Internal error: {e}")
     finally:
         print(f"⏱ Final total time: {round(time.time() - start, 2)}s")
+
