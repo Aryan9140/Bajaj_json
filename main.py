@@ -137,7 +137,7 @@ def choose_mistral_params(page_count: int, context_text: Optional[str]):
     # NOTE: keep your budget logic intact
     ctx_tok = approx_tokens_from_text(context_text or "")
     if page_count <= 100:
-        max_tokens, temperature, timeout = 800, 0.1, 18
+        max_tokens, temperature, timeout = 1200, 0.1, 18
     elif page_count <= 200:
         max_tokens, temperature, timeout = 1300, 0.18, 15
     else:
@@ -149,7 +149,7 @@ def choose_mistral_params(page_count: int, context_text: Optional[str]):
 def choose_groq_params(page_count: int, context_text: Optional[str]):
     ctx_tok = approx_tokens_from_text(context_text or "")
     if page_count <= 100:
-        max_tokens, temperature, timeout = 1100, 0.0, 30
+        max_tokens, temperature, timeout = 1300, 0.0, 30
     elif page_count <= 200:
         max_tokens, temperature, timeout = 1700, 0.2, 30
     else:
@@ -208,7 +208,7 @@ def extract_text_from_pdf_url(pdf_url: str) -> Tuple[str, int, str]:
     os.remove(tmp_path)
     return (full_text.strip() if page_count <= 200 else "", page_count, title or "Untitled Document")
 
-def split_text(text: str, chunk_size: int = 1300, overlap: int = 300) -> List[str]:
+def split_text(text: str, chunk_size: int = 1400, overlap: int = 300) -> List[str]:
     chunks, start = [], 0
     n = len(text)
     while start < n and len(chunks) < 15:
