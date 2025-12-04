@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+D:\Bajaj_Hakrxx_Hackathon\Bajaj_json\.env
 
 # Virtual environment
 venv/
@@ -23,3 +24,8 @@ venv/
 # Windows system files
 Thumbs.db
 /venv
+
+\Bajaj_json\.env
+
+Bajaj_json\.env
+
